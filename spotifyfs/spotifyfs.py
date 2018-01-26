@@ -1,35 +1,23 @@
 #!/usr/bin/python
 # -*- coding: utf-8 -*-
 
-from __future__ import absolute_import, print_function
-
-import stat
-import errno
-import fuse
-import os
-import urllib2
-import inspect
-from io import BytesIO
-import routefs
-from routes import Mapper
-from expiringdict import ExpiringDict
-import json
-import sys
-import traceback
-import types
-
 import spotipy
 import spotipy.oauth2
 import spotipy.util
 
-def path2url(path):
-    return "file://" + urllib2.pathname2url(os.path.abspath(path))
+from expiringdict import ExpiringDict
+from functools import partial
 
-class SpotifyFS(routefs.RouteFS):
-    def __init__(self, *args, **kwargs):
-        routefs.RouteFS.__init__(self, *args, **kwargs)
-        self.fuse_args.add("allow_other", True)
+import inspect
+import sys
+import json
 
+import fuse
+import logging
+import myfs
+
+class SpotifyFS():
+    def __init__(self):
         # There is a massive performance gain if we cache a directory's contents.
         self.cache = ExpiringDict(max_len=64*1024, max_age_seconds=3600)
 
@@ -39,497 +27,638 @@ class SpotifyFS(routefs.RouteFS):
             client_id='85fe52cff756410095a3714c028c288b',
             client_secret='822d085d81af4aae9ad800609dcc3706',
             redirect_uri='https://example.com')
-        print("token: %s" % self.token)
 
-
-    def fsinit(self):
         self.spotify = spotipy.Spotify(auth=self.token)
-        print("Spotify created")
         print("me: %s" % self.spotify.me())
 
+        self.rootEntry = SpotifyFS.RootEntry(self)
+        self.artistEntries = {}
+        self.albumEntries = {}
+        self.trackEntries = {}
+        self.playlistEntries = {}
 
-    def make_map(self):
-        m = Mapper()
-        m.connect('/', controller='getRoot')
-        m.connect('/.id', controller='getIdDir')
-        m.connect('/Artists{subpath:(/.*)?}', controller='getCurrentUserArtists')
-        m.connect('/Playlists{subpath:(/.*)?}', controller='getCurrentUserPlaylists')
+    class DirEntry(myfs.DirEntry):
+        raw_file = '.data.json'
+        image_file = None
+        default_image = 'https://www1-lw.xda-cdn.com/files/2013/09/music.jpg'
 
+        def __init__(self, spotifyfs, id=None):
+            self.spotifyfs = spotifyfs
+            self.id = id
+            self.readdir_called = False
+            super(SpotifyFS.DirEntry, self).__init__({})
 
-        m.connect('/.id/track', controller='getEmptyDir')
-        m.connect('/.id/track/{trackId}{.format:mp3|desktop|json}', controller='getTrack')
+        def getRawData(self):
+            return {}
 
-        m.connect('/.id/album', controller='getEmptyDir')
-        m.connect('/.id/album/{albumId}{subpath:(/.*)?}', controller='getAlbum')
+        def listFiles(self):
+            return []
 
-        m.connect('/.id/artist', controller='getEmptyDir')
-        m.connect('/.id/artist/{artistId}{subpath:(/.*)?}', controller='getArtist')
+        def getNewEntry(self, name):
+            return None
 
-        m.connect('/.id/user', controller='getEmptyDir')
-        m.connect('/.id/user/{userId}{subpath:(/.*)?}', controller='getUser')
+        def __getitem__(self, name):
+            if name == self.raw_file:
+                return json.dumps(self.getRawData(), indent=4)
+            elif name == self.image_file:
+                try:
+                    return myfs.Urllib1FileEntry(self.getRawData()['images'][0]['url'], fake_size=1024)
+                except:
+                    return myfs.Urllib1FileEntry(self.default_image, fake_size=1024)
 
-        m.connect('/.id/playlist', controller='getEmptyDir')
-        m.connect('/.id/playlist/{userId}_{playlistId}{subpath:(/.*)?}', controller='getPlaylist')
+            elif name == '.directory':
+                return inspect.cleandoc("""
+                    [Desktop Entry]
+                    Name={name}
+                    Comment={comment}
+                    Icon=./{icon}
+                    Type=Directory
+                    """.format(name='Foobar', comment='fooo', icon=self.image_file))
 
-        #m.connect('/.id/user/{user}/playlist/{playlistId}', controller='getPlaylist')
-        return m
+            if not self.readdir_called:
+                list(self.readdir('/', None))
 
-
-
-    def getRoot(self):
-        return routefs.Directory(['Artists', 'Playlists'])
-
-
-    def getIdDir(self):
-        return routefs.Directory([])
-
-    def getEmptyDir(self):
-        return routefs.Directory([])
-
-
-
-    def getTrack(self, trackId, format):
-        cache_key = ('track', trackId)
-        try:
-            track = self.cache[cache_key]
-        except:
-            print('getTrack %s' % trackId)
-            track = self.spotify.track(trackId)
-            self.cache[cache_key] = track
-
-        if format == 'json':
-            return routefs.File(json.dumps(track, indent=4))
-
-        elif format == 'desktop':
-            return routefs.File((inspect.cleandoc(
-                u"""
-                [Desktop Entry]
-                Encoding=UTF-8
-                Name=%s
-                Type=Link
-                URL=%s
-                Icon=text-html
-                """) % (track['name'], track['external_urls']['spotify'])).encode('utf8'))
-
-        elif format == 'mp3':
-            if track['preview_url'] is not None:
-                return Urllib1File(track['preview_url'])
+            gen = self.contents.get(name, None)
+            if gen is not None:
+                return gen()
             else:
-                return routefs.File('')
+                newEntry = self.getNewEntry(name)
+                if newEntry is not None:
+                    self.contents[name] = newEntry
+                    return newEntry()
 
 
+        def readdir(self, path, fh):
+            yield '.'
+            yield '..'
 
-    def getAlbum(self, albumId, subpath='/'):
-        cache_key = ('album', albumId)
+            for filename, gen in self.listFiles():
+                filename = filename.replace('/', '∕')
+                self.contents[filename] = gen
+                yield filename
+
+            yield '.directory'
+            if self.raw_file is not None:
+                yield self.raw_file
+            if self.image_file is not None:
+                yield self.image_file
+
+            self.readdir_called = True
+
+    def getArtist(self, id):
         try:
-            album = self.cache[cache_key]
+            return self.artistEntries[id]
         except:
-            print('getAlbum %s' % albumId)
-            album = self.spotify.album(albumId)
+            artistEntry = self.ArtistEntry(self, id)
+            self.artistEntries[id] = artistEntry
+            return artistEntry
 
-            tracks_it = album['tracks']
-            album['tracks'] = tracks_it['items']
-            while tracks_it['next']:
-                tracks_it = self.spotify.next(tracks_it)
-                album['tracks'] += tracks_it['items']
-
-            self.cache[cache_key] = album
-
-        structure = {
-            '.album.json': routefs.File(json.dumps(album, indent=4))
-        }
-
-        if album['images']:
-            structure['image.jpg'] = Urllib1File(album['images'][0]['url'])
-
-        track_numbers = set()
-        disc_numbers = set()
-
+    def getAlbum(self, id):
         try:
-            for track in album['tracks']:
-                self.cache[('track', track['id'])] = track
+            return self.albumEntries[id]
+        except:
+            albumEntry = self.AlbumEntry(self, id)
+            self.albumEntries[id] = albumEntry
+            return albumEntry
+
+    def getPlaylist(self, userId, playlistId):
+        try:
+            return self.playlistEntries[(userId, playlistId)]
+        except:
+            playlistEntry = self.PlaylistEntry(self, (userId, playlistId))
+            self.playlistEntries[(userId, playlistId)] = playlistEntry
+            return playlistEntry
+
+    def getTrack(self, id):
+        try:
+            return self.trackEntries[id]
+        except:
+            trackEntry = self.TrackEntry(self, id)
+            self.trackEntries[id] = trackEntry
+            return trackEntry
+
+
+
+    class RootEntry(DirEntry):
+        raw_file = None
+
+        def __init__(self, spotifyfs):
+            super(SpotifyFS.RootEntry, self).__init__(spotifyfs)
+            self.artists = self.spotifyfs.CurrentUserArtistsEntry(self.spotifyfs)
+            self.playlists = self.spotifyfs.CurrentUserPlaylistsEntry(self.spotifyfs)
+
+        def listFiles(self):
+            yield 'Artists', lambda: self.artists
+            yield 'Playlists', lambda: self.playlists
+
+
+    class TrackEntry(DirEntry):
+        raw_file = '.track.json'
+        image_file = '.track.jpg'
+
+        def getRawData(self):
+            cache_key = ('track', self.id)
+            try:
+                track = self.spotifyfs.cache[cache_key]
+            except:
+                print('getTrack %s' % self.id)
+                track = self.spotify.track(trackId)
+                self.spotifyfs.cache[cache_key] = track
+            return track
+
+        def listFiles(self):
+            track = self.getRawData()
+            if track['preview_url'] is not None:
+                yield 'sample.mp3', lambda: myfs.Urllib1FileEntry(track['preview_url'], fake_size=1024)
+            else:
+                yield 'sample.mp3', lambda: ''
+
+
+    class ArtistEntry(DirEntry):
+        raw_file = '.artist.json'
+        image_file = '.artist.jpg'
+
+        def getRawData(self):
+            cache_key = ('artist', self.id)
+            try:
+                artist = self.spotifyfs.cache[cache_key]
+            except:
+                print('getArtist %s' % self.id)
+                artist = self.spotifyfs.spotify.artist(self.id)
+
+                albums_it = self.spotifyfs.spotify.artist_albums(self.id, limit=50)
+                artist['albums'] = albums_it['items']
+                while albums_it['next']:
+                    albums_it = self.spotifyfs.spotify.next(albums_it)
+                    artist['albums'] += albums_it['items']
+
+                self.spotifyfs.cache[cache_key] = artist
+            return artist
+
+        def listFiles(self):
+            for album in self.getRawData()['albums']:
+                filename = album['name']
+                yield filename, partial(lambda id: self.spotifyfs.getAlbum(id), album['id'])
+
+
+
+    class AlbumEntry(DirEntry):
+        raw_file = '.album.json'
+        image_file = '.album.jpg'
+
+        def getRawData(self):
+            cache_key = ('album', self.id)
+            try:
+                album = self.spotifyfs.cache[cache_key]
+            except:
+                print('getAlbum %s' % self.id)
+                album = self.spotifyfs.spotify.album(self.id)
+
+                tracks_it = album['tracks']
+                album['tracks'] = tracks_it['items']
+                while tracks_it['next']:
+                    tracks_it = self.spotifyfs.spotify.next(tracks_it)
+                    album['tracks'] += tracks_it['items']
+
+                for track in album['tracks']:
+                    self.spotifyfs.cache[('track', track['id'])] = track
+
+                self.spotifyfs.cache[cache_key] = album
+            return album
+
+        def listFiles(self):
+            tracks = self.getRawData()['tracks']
+
+            track_numbers = set()
+            disc_numbers = set()
+
+            for track in tracks:
                 track_numbers.add(track['track_number'])
                 disc_numbers.add(track['disc_number'])
 
-            for track in album['tracks']:
-                if len(disc_numbers) > 1:
-                    tracklist = structure.setdefault('Disc %d' % track['disc_number'], {})
-                else:
-                    tracklist = structure
-
-                filename = track['name'] + u'.mp3'
+            for track in tracks:
+                filename = track['name'] + '.mp3'
                 if len(track_numbers) > 1:
-                    filename = u"%02d - %s" % (track['track_number'], filename)
+                    filename = "%02d - %s" % (track['track_number'], filename)
 
-                filename = filename.replace(u'/', u'∕')
-
-                tracklist[filename] = routefs.Symlink('.id/track/' + track['id'] + '.mp3')
-        except:
-            traceback.print_exc()
-
-        return handleSubpath(structure, subpath)
+                yield filename, partial(lambda id: self.spotifyfs.getTrack(id)['sample.mp3'], track['id'])
 
 
 
-    def getArtist(self, artistId, subpath='/'):
-        cache_key = ('artist', artistId)
-        try:
-            artist = self.cache[cache_key]
-        except:
-            print('getArtist %s' % artistId)
-            artist = self.spotify.artist(artistId)
+    class PlaylistEntry(DirEntry):
+        raw_file = '.playlist.json'
+        image_file = '.playlist.jpg'
 
-            albums_it = self.spotify.artist_albums(artistId)
-            artist['albums'] = albums_it['items']
-            while albums_it['next']:
-                albums_it = self.spotify.next(albums_it)
-                artist['albums'] += albums_it['items']
+        def getRawData(self):
+            userId, playlistId = self.id
+            cache_key = ('playlist', userId, playlistId)
+            try:
+                playlist = self.spotifyfs.cache[cache_key]
+            except:
+                print('getPlaylist %s/%s' % (userId, playlistId))
+                playlist = self.spotifyfs.spotify.user_playlist(userId, playlistId)
 
-            self.cache[cache_key] = artist
+                tracks_it = playlist['tracks']
+                playlist['tracks'] = tracks_it['items']
+                while tracks_it['next']:
+                    tracks_it = self.spotifyfs.spotify.next(tracks_it)
+                    playlist['tracks'] += tracks_it['items']
 
+                playlist['tracks'] = [
+                    track['track']
+                    for track in playlist['tracks']
+                    if not track['is_local']
+                ]
 
-        structure = {
-            '.artist.json': routefs.File(json.dumps(artist, indent=4))
-        }
+                for track in playlist['tracks']:
+                    self.spotifyfs.cache[('track', track['id'])] = track
 
-        if artist['images']:
-            structure['image.jpg'] = Urllib1File(artist['images'][0]['url'])
+                self.spotifyfs.cache[cache_key] = playlist
+            return playlist
 
-        try:
-            for album in artist['albums']:
-                filename = album['name']
-                filename = filename.replace(u'/', u'∕')
-
-                structure[filename] = routefs.Symlink('../../album/' + album['id'])
-        except:
-            traceback.print_exc()
-
-        return handleSubpath(structure, subpath)
-
-
-
-    def getUser(self, userId, subpath='/'):
-        cache_key = ('user', userId)
-        try:
-            user = self.cache[cache_key]
-        except:
-            print('getUser %s' % userId)
-            user = self.spotify.user(userId)
-
-            playlists_it = self.spotify.user_playlists(userId, limit=2)
-            user['playlists'] = playlists_it['items']
-            while playlists_it['next']:
-                playlists_it = self.spotify.next(playlists_it)
-                user['playlists'] += playlists_it['items']
-
-            self.cache[cache_key] = user
-
-
-        structure = {
-            '.user.json': routefs.File(json.dumps(user, indent=4))
-        }
-
-        if user['images']:
-            structure['image.jpg'] = Urllib1File(user['images'][0]['url'])
-
-        try:
-            for playlist in user['playlists']:
-                filename = playlist['name']
-                filename = filename.replace(u'/', u'∕')
-
-                structure[filename] = routefs.Symlink('../../playlist/%s_%s' % (userId, playlist['id']))
-        except:
-            traceback.print_exc()
-
-        return handleSubpath(structure, subpath)
-
-
-    def getPlaylist(self, userId, playlistId, subpath='/'):
-        cache_key = ('playlist', userId, playlistId)
-        try:
-            playlist = self.cache[cache_key]
-        except:
-            print('getPlaylist %s:%s' % (userId, playlistId))
-            playlist = self.spotify.user_playlist(userId, playlistId)
-
-            tracks_it = playlist['tracks']
-            playlist['tracks'] = tracks_it['items']
-            while tracks_it['next']:
-                tracks_it = self.spotify.next(tracks_it)
-                playlist['tracks'] += tracks_it['items']
-
-            playlist['tracks'] = [
-                track['track']
-                for track in playlist['tracks']
-                if not track['is_local']
-            ]
-
-            self.cache[cache_key] = playlist
-
-
-        structure = {
-            '.playlist.json': routefs.File(json.dumps(playlist, indent=4))
-        }
-
-        if playlist['images']:
-            structure['image.jpg'] = Urllib1File(playlist['images'][0]['url'])
-
-        try:
+        def listFiles(self):
             n = 0
-            for track in playlist['tracks']:
-                self.cache[('track', track['id'])] = track
 
-                filename = track['name'] + u'.mp3'
+            for track in self.getRawData()['tracks']:
+                filename = track['name'] + '.mp3'
                 if len(track['artists']) > 0:
-                    filename = u', '.join([artist['name'] for artist in track['artists']]) + u' - ' + filename
+                    filename = ', '.join([artist['name'] for artist in track['artists']]) + ' - ' + filename
 
                 n += 1
-                filename = u'%03d - %s' % (n, filename)
-
-                filename = filename.replace(u'/', u'∕')
-
-                structure[filename] = routefs.Symlink('../../track/' + track['id'] + '.mp3')
-
-        except:
-            traceback.print_exc()
-
-        return handleSubpath(structure, subpath)
+                filename = '%03d - %s' % (n, filename)
+                yield filename, partial(lambda id: self.spotifyfs.getTrack(id)['sample.mp3'], track['id'])
 
 
 
-    def getCurrentUserPlaylists(self, subpath='/'):
-        cache_key = ('currentuser_playlists')
-        try:
-            playlists = self.cache[cache_key]
-        except:
-            print('getCurrentUserPlaylists')
-            playlists_it = self.spotify.current_user_playlists()
-            playlists = playlists_it['items']
-            while playlists_it['next']:
-                playlists_it = self.spotify.next(playlists_it)
-                playlists += playlists_it['items']
+    class CurrentUserArtistsEntry(DirEntry):
+        raw_file = '.currentuser_artists.json'
 
-            self.cache[cache_key] = playlists
-
-
-        structure = {
-            '.playlists.json': routefs.File(json.dumps(playlists, indent=4))
-        }
-
-        try:
-            for playlist in playlists:
-                filename = playlist['name']
-                filename = filename.replace(u'/', u'∕')
-
-                structure[filename] = routefs.Symlink('../.id/playlist/' + playlist['owner']['id'] + '_' + playlist['id'])
-        except:
-            traceback.print_exc()
-
-        return handleSubpath(structure, subpath)
-
-
-
-    def getCurrentUserArtists(self, subpath='/'):
-        cache_key = ('currentuser_artists')
-        try:
-            artists = self.cache[cache_key]
-        except:
-            print('getCurrentUserArtists')
-            artists_it = self.spotify.current_user_followed_artists()['artists']
-            artists = artists_it['items']
-            while artists_it['next']:
-                artists_it = self.spotify.next(artists_it)['artists']
-                artists += artists_it['items']
-
-            self.cache[cache_key] = artists
-
-
-        structure = {
-            '.artists.json': routefs.File(json.dumps(artists, indent=4))
-        }
-
-        try:
-            for artist in artists:
-                filename = artist['name']
-                filename = filename.replace(u'/', u'∕')
-
-                structure[filename] = routefs.Symlink('../.id/artist/' + artist['id'])
-
-        except:
-            traceback.print_exc()
-
-        return handleSubpath(structure, subpath)
-
-
-
-def handleSubpath(structure, subpath):
-    try:
-        for element in path_elements(subpath):
-            if type(structure) is dict:
-                structure = structure[element]
-            else:
-                return
-
-    except KeyError:
-        return
-
-    if type(structure) is dict:
-        return routefs.Directory([
-            filename.encode('utf8')
-            for filename in structure.keys()
-        ])
-    else:
-        return structure
-
-
-
-def path_elements(path):
-    return [element for element in path.split('/') if element]
-
-
-
-class BufferedFile(routefs.TreeEntry, str):
-    """
-    A class representing a file that will can be read/write as a big buffer
-    """
-
-    default_mode = 0444
-
-    open_files = {}
-
-    class BufferedFileHandle:
-        def __init__(self, buffer):
-            self.buffer = buffer
-            self.dirty = False
-            self.refs = 0
-
-    def buffer_size(self):
-        """
-        This must be fast in order to have responsive directory listing.
-        If you cannot make it fast, returning zero is often OK.
-
-        Return None to use buffer_read() as means to fetch the length.
-
-        You can also return -ENOENT and -EIO to signal errors
-        """
-        return None
-
-    def buffer_read(self):
-        """
-        Read remote file into a byte buffer.
-
-        Return None to trigger ENOENT and raise some exception to trigger EIO
-        """
-        raise Exception("Read not supported")
-
-    def buffer_write(self, buffer):
-        """
-        Write byte buffer into remote file
-
-        Raise some exception to trigger EIO
-        """
-        raise Exception("Write not supported")
-
-    def cache_key(self):
-        return (self.__class__, self)
-
-
-    def getattr(self):
-        st = routefs.RouteStat()
-        st.st_mode = stat.S_IFREG | self.mode
-        st.st_nlink = 1
-
-        fh = BufferedFile.open_files.get(self.cache_key(), None)
-        if fh:
-            st.st_size = len(fh.buffer.getvalue())
-        else:
+        def getRawData(self):
+            cache_key = ('currentuser_artists')
             try:
-                st.st_size = self.buffer_size()
-                if st.st_size is None:
-                    st.st_size = len(self.buffer_read())
-                elif st.st_size < 0:
-                    return st.st_size
+                artists = self.spotifyfs.cache[cache_key]
             except:
-                return -errno.EIO
+                print('getCurrentUserArtists')
+                artists_it = self.spotifyfs.spotify.current_user_followed_artists()['artists']
+                artists = artists_it['items']
+                while artists_it['next']:
+                    artists_it = self.spotifyfs.spotify.next(artists_it)['artists']
+                    artists += artists_it['items']
 
-        return st
+                self.spotifyfs.cache[cache_key] = artists
+
+            return artists
 
 
-    def open(self, flags):
-        fh = BufferedFile.open_files.get(self.cache_key(), None)
-        if fh is None:
+        def listFiles(self):
+            for artist in self.getRawData():
+                filename = artist["name"]
+                yield filename, partial(lambda id: self.spotifyfs.getArtist(id), artist['id'])
+
+        def getNewEntry(self, name):
+            results = self.spotifyfs.spotify.search(q=name, type='artist')
+            items = results['artists']['items']
+            if len(items) > 0:
+                return lambda: self.spotifyfs.getArtist(items[0]['id'])
+
+
+
+
+    class CurrentUserPlaylistsEntry(DirEntry):
+        raw_file = '.currentuser_playlists.json'
+
+        def getRawData(self):
+            cache_key = ('currentuser_playlists')
             try:
-                buffer = self.buffer_read()
-                if buffer is None:
-                    return -errno.ENOENT
+                playlists = self.spotifyfs.cache[cache_key]
             except:
-                return -errno.EIO
+                print('getCurrentUserPlaylists')
+                playlists_it = self.spotifyfs.spotify.current_user_playlists()
+                playlists = playlists_it['items']
+                while playlists_it['next']:
+                    playlists_it = self.spotifyfs.spotify.next(playlists_it)
+                    playlists += playlists_it['items']
 
-            fh = BufferedFile.BufferedFileHandle(BytesIO(buffer))
-            BufferedFile.open_files[self.cache_key()] = fh
+                self.spotifyfs.cache[cache_key] = playlists
 
-        fh.refs += 1
-        return fh
-
-
-    def release(self, flags, fh):
-        fh.refs -= 1
-        if fh.refs == 0:
-            del BufferedFile.open_files[self.cache_key()]
-            return self.flush(fh)
+            return playlists
 
 
-    def flush(self, fh):
-        if fh.dirty:
-            try:
-                self.buffer_write(fh.buffer.getvalue())
-            except:
-                return -errno.EIO
-        return 0
-
-
-    def truncate(self, len):
-        fh = self.open(0)
-        if isinstance(fh, int):
-            return fh  #error code
-
-        fh.dirty = True
-        fh.buffer.truncate(len)
-        return self.release(0, fh)
-
-
-    def read(self, length, offset, fh):
-        fh.buffer.seek(offset)
-        return fh.buffer.read(length)
-
-
-    def write(self, buffer, offset, fh):
-        fh.dirty = True
-        fh.buffer.seek(offset)
-        fh.buffer.write(buffer)
-        return len(buffer)
+        def listFiles(self):
+            for playlist in self.getRawData():
+                filename = playlist["name"]
+                yield filename, partial(lambda user, id: self.spotifyfs.getPlaylist(user, id), playlist['owner']['id'], playlist['id'])
 
 
 
-class Urllib1File(BufferedFile):
-    open_files = {}
 
-    """
-    A dummy class representing a file that will be fetched via urllib2 that should be a file
-    """
-    default_mode = 0444
+    #def getCurrentUserPlaylists(self, subpath='/'):
+        #cache_key = ('currentuser_playlists')
+        #try:
+            #playlists = self.cache[cache_key]
+        #except:
+            #print('getCurrentUserPlaylists')
+            #playlists_it = self.spotify.current_user_playlists()
+            #playlists = playlists_it['items']
+            #while playlists_it['next']:
+                #playlists_it = self.spotify.next(playlists_it)
+                #playlists += playlists_it['items']
 
-    def buffer_size(self):
-        request = urllib2.Request(self)
-        request.get_method = lambda : 'HEAD'
-        try:
-            return int(urllib2.urlopen(request).info()['content-length'])
-        except:
-            return None
+            #self.cache[cache_key] = playlists
 
-    def buffer_read(self):
-        return urllib2.urlopen(self).read()
+
+        #structure = {
+            #'.playlists.json': routefs.File(json.dumps(playlists, indent=4))
+        #}
+
+        #try:
+            #for playlist in playlists:
+                #filename = playlist['name']
+                #filename = filename.replace(u'/', u'∕')
+
+                #structure[filename] = routefs.Symlink('../.id/playlist/' + playlist['owner']['id'] + '_' + playlist['id'])
+        #except:
+            #traceback.print_exc()
+
+
+
+
+
+
+    #def getTrack(self, trackId, format):
+        #cache_key = ('track', trackId)
+        #try:
+            #track = self.cache[cache_key]
+        #except:
+            #print('getTrack %s' % trackId)
+            #track = self.spotify.track(trackId)
+            #self.cache[cache_key] = track
+
+        #if format == 'json':
+            #return routefs.File(json.dumps(track, indent=4))
+
+        #elif format == 'desktop':
+            #return routefs.File((inspect.cleandoc(
+                #u"""
+                #[Desktop Entry]
+                #Encoding=UTF-8
+                #Name=%s
+                #Type=Link
+                #URL=%s
+                #Icon=text-html
+                #""") % (track['name'], track['external_urls']['spotify'])).encode('utf8'))
+
+        #elif format == 'mp3':
+            #if track['preview_url'] is not None:
+                #return Urllib1File(track['preview_url'])
+            #else:
+                #return routefs.File('')
+
+
+
+    #def getAlbum(self, albumId, subpath='/'):
+        #cache_key = ('album', albumId)
+        #try:
+            #album = self.cache[cache_key]
+        #except:
+            #print('getAlbum %s' % albumId)
+            #album = self.spotify.album(albumId)
+
+            #tracks_it = album['tracks']
+            #album['tracks'] = tracks_it['items']
+            #while tracks_it['next']:
+                #tracks_it = self.spotify.next(tracks_it)
+                #album['tracks'] += tracks_it['items']
+
+            #self.cache[cache_key] = album
+
+        #structure = {
+            #'.album.json': routefs.File(json.dumps(album, indent=4))
+        #}
+
+        #if album['images']:
+            #structure['image.jpg'] = Urllib1File(album['images'][0]['url'])
+
+        #track_numbers = set()
+        #disc_numbers = set()
+
+        #try:
+            #for track in album['tracks']:
+                #self.cache[('track', track['id'])] = track
+                #track_numbers.add(track['track_number'])
+                #disc_numbers.add(track['disc_number'])
+
+            #for track in album['tracks']:
+                #if len(disc_numbers) > 1:
+                    #tracklist = structure.setdefault('Disc %d' % track['disc_number'], {})
+                #else:
+                    #tracklist = structure
+
+                #filename = track['name'] + u'.mp3'
+                #if len(track_numbers) > 1:
+                    #filename = u"%02d - %s" % (track['track_number'], filename)
+
+                #filename = filename.replace(u'/', u'∕')
+
+                #tracklist[filename] = routefs.Symlink('.id/track/' + track['id'] + '.mp3')
+        #except:
+            #traceback.print_exc()
+
+        #return handleSubpath(structure, subpath)
+
+
+
+    #def getArtist(self, artistId, subpath='/'):
+        #cache_key = ('artist', artistId)
+        #try:
+            #artist = self.cache[cache_key]
+        #except:
+            #print('getArtist %s' % artistId)
+            #artist = self.spotify.artist(artistId)
+
+            #albums_it = self.spotify.artist_albums(artistId)
+            #artist['albums'] = albums_it['items']
+            #while albums_it['next']:
+                #albums_it = self.spotify.next(albums_it)
+                #artist['albums'] += albums_it['items']
+
+            #self.cache[cache_key] = artist
+
+
+        #structure = {
+            #'.artist.json': routefs.File(json.dumps(artist, indent=4))
+        #}
+
+        #if artist['images']:
+            #structure['image.jpg'] = Urllib1File(artist['images'][0]['url'])
+
+        #try:
+            #for album in artist['albums']:
+                #filename = album['name']
+                #filename = filename.replace(u'/', u'∕')
+
+                #structure[filename] = routefs.Symlink('../../album/' + album['id'])
+        #except:
+            #traceback.print_exc()
+
+        #return handleSubpath(structure, subpath)
+
+
+
+    #def getUser(self, userId, subpath='/'):
+        #cache_key = ('user', userId)
+        #try:
+            #user = self.cache[cache_key]
+        #except:
+            #print('getUser %s' % userId)
+            #user = self.spotify.user(userId)
+
+            #playlists_it = self.spotify.user_playlists(userId, limit=2)
+            #user['playlists'] = playlists_it['items']
+            #while playlists_it['next']:
+                #playlists_it = self.spotify.next(playlists_it)
+                #user['playlists'] += playlists_it['items']
+
+            #self.cache[cache_key] = user
+
+
+        #structure = {
+            #'.user.json': routefs.File(json.dumps(user, indent=4))
+        #}
+
+        #if user['images']:
+            #structure['image.jpg'] = Urllib1File(user['images'][0]['url'])
+
+        #try:
+            #for playlist in user['playlists']:
+                #filename = playlist['name']
+                #filename = filename.replace(u'/', u'∕')
+
+                #structure[filename] = routefs.Symlink('../../playlist/%s_%s' % (userId, playlist['id']))
+        #except:
+            #traceback.print_exc()
+
+        #return handleSubpath(structure, subpath)
+
+
+    #def getPlaylist(self, userId, playlistId, subpath='/'):
+        #cache_key = ('playlist', userId, playlistId)
+        #try:
+            #playlist = self.cache[cache_key]
+        #except:
+            #print('getPlaylist %s:%s' % (userId, playlistId))
+            #playlist = self.spotify.user_playlist(userId, playlistId)
+
+            #tracks_it = playlist['tracks']
+            #playlist['tracks'] = tracks_it['items']
+            #while tracks_it['next']:
+                #tracks_it = self.spotify.next(tracks_it)
+                #playlist['tracks'] += tracks_it['items']
+
+            #playlist['tracks'] = [
+                #track['track']
+                #for track in playlist['tracks']
+                #if not track['is_local']
+            #]
+
+            #self.cache[cache_key] = playlist
+
+
+        #structure = {
+            #'.playlist.json': routefs.File(json.dumps(playlist, indent=4))
+        #}
+
+        #if playlist['images']:
+            #structure['image.jpg'] = Urllib1File(playlist['images'][0]['url'])
+
+        #try:
+            #n = 0
+            #for track in playlist['tracks']:
+                #self.cache[('track', track['id'])] = track
+
+                #filename = track['name'] + u'.mp3'
+                #if len(track['artists']) > 0:
+                    #filename = u', '.join([artist['name'] for artist in track['artists']]) + u' - ' + filename
+
+                #n += 1
+                #filename = u'%03d - %s' % (n, filename)
+
+                #filename = filename.replace(u'/', u'∕')
+
+                #structure[filename] = routefs.Symlink('../../track/' + track['id'] + '.mp3')
+
+        #except:
+            #traceback.print_exc()
+
+        #return handleSubpath(structure, subpath)
+
+
+
+    #def getCurrentUserPlaylists(self, subpath='/'):
+        #cache_key = ('currentuser_playlists')
+        #try:
+            #playlists = self.cache[cache_key]
+        #except:
+            #print('getCurrentUserPlaylists')
+            #playlists_it = self.spotify.current_user_playlists()
+            #playlists = playlists_it['items']
+            #while playlists_it['next']:
+                #playlists_it = self.spotify.next(playlists_it)
+                #playlists += playlists_it['items']
+
+            #self.cache[cache_key] = playlists
+
+
+        #structure = {
+            #'.playlists.json': routefs.File(json.dumps(playlists, indent=4))
+        #}
+
+        #try:
+            #for playlist in playlists:
+                #filename = playlist['name']
+                #filename = filename.replace(u'/', u'∕')
+
+                #structure[filename] = routefs.Symlink('../.id/playlist/' + playlist['owner']['id'] + '_' + playlist['id'])
+        #except:
+            #traceback.print_exc()
+
+        #return handleSubpath(structure, subpath)
+
+
+
+    #def getCurrentUserArtists(self, subpath='/'):
+        #cache_key = ('currentuser_artists')
+        #try:
+            #artists = self.cache[cache_key]
+        #except:
+            #print('getCurrentUserArtists')
+            #artists_it = self.spotify.current_user_followed_artists()['artists']
+            #artists = artists_it['items']
+            #while artists_it['next']:
+                #artists_it = self.spotify.next(artists_it)['artists']
+                #artists += artists_it['items']
+
+            #self.cache[cache_key] = artists
+
+
+        #structure = {
+            #'.artists.json': routefs.File(json.dumps(artists, indent=4))
+        #}
+
+        #try:
+            #for artist in artists:
+                #filename = artist['name']
+                #filename = filename.replace(u'/', u'∕')
+
+                #structure[filename] = routefs.Symlink('../.id/artist/' + artist['id'])
+
+        #except:
+            #traceback.print_exc()
+
+        #return handleSubpath(structure, subpath)
+
 
 
 if __name__ == '__main__':
-    routefs.main(SpotifyFS)
+    logging.basicConfig(level=logging.DEBUG)
+    fuse.FUSE(myfs.LoggingFs(SpotifyFS().rootEntry), sys.argv[1], foreground=True)
