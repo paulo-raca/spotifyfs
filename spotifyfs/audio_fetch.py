@@ -6,7 +6,9 @@ import os
 import threading
 import traceback
 import time
+import sys
 from io import BytesIO
+import subprocess
 
 class AudioSink:
   def __init__(self):
@@ -16,7 +18,7 @@ class AudioSink:
       try:
           #print('<', end='', flush=True)
           with self.target.cond:
-              self.target.buffer = self.target.buffer + buf
+              self.target.lame.stdin.write(buf)
               self.target.cond.notify_all()
           #print('>', end='', flush=True)
       except:
@@ -35,37 +37,40 @@ class SpotifyAudioFetcher():
         class reader:
             def __init__(self, audio_fetcher):
                 self.audio_fetcher = audio_fetcher
-                self.buffer = None
+                self.lame = None
                 self.playing = False
                 self.cond = threading.Condition()
 
             def buf_len(self):
-                with self.cond:
-                    if self.buffer is not None:
-                        return len(self.buffer)
-                    else:
-                        return 0
+                return 0
 
             def read(self, size, offset):
                 with self.cond:
                     # Lazy open
-                    if self.buffer is None:
+                    if self.lame is None:
                         print('Waiting to play %s' % trackId)
                         self.audio_fetcher.semaphore.acquire()
                         self.playing = True
                         print('Playing %s' % trackId)
-                        self.buffer = b''
+
+                        self.lame = subprocess.Popen(
+                            [
+                                "lame",
+                                "-r", "-s", "44.1", "--bitwidth", "16", # Raw PCM, 16-bit, 44.1kHz,
+                                "-V", "0",  # High-quality encoding
+                                "--verbose",  #Dump shit on screen
+                                "-", "-"  # Use stdin/stdout to read/write streams
+                            ],
+                            stdin=subprocess.PIPE,
+                            stdout=subprocess.PIPE,
+                            stderr=sys.stderr.fileno()
+                        )
+
                         self.audio_fetcher.sink.target = self
                         self.future = self.audio_fetcher.player.load(SpotifyId(trackId))
                         self.future.add_done_callback(lambda x: self._audio_ended())
 
-                    # Wait for data
-                    while self.playing and len(self.buffer) <= offset + size:
-                        #print('Buffer underflow... %d/%d' % (offset, len(self.buffer)))
-                        self.cond.wait()
-
-                    #print('Buffer infill: %d/%d' % (offset, len(self.buffer)))
-                    return self.buffer[offset:offset+size]
+                return self.lame.stdout.read(size)
 
             def _audio_ended(self):
                 with self.cond:
@@ -75,6 +80,7 @@ class SpotifyAudioFetcher():
                     self.audio_fetcher.semaphore.release()
 
                     # Signal to anyone waiting on the cond
+                    self.lame.stdin.close()
                     self.playing = False
                     self.cond.notify_all()
 
@@ -83,6 +89,8 @@ class SpotifyAudioFetcher():
                 with self.cond:
                     if self.playing:
                         self.audio_fetcher.player.stop()
+                    self.lame.stdout.close()
+                    self.lame.kill()
 
             def wait(self):
                 if self.future:
