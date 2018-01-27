@@ -5,16 +5,21 @@ import spotipy
 import spotipy.oauth2
 import spotipy.util
 
+from librespot import Session, SpotifyId
+
 from expiringdict import ExpiringDict
 from functools import partial
+from stat import S_IFDIR, S_IFLNK, S_IFREG
 
 import inspect
 import sys
 import json
+import time
 
 import fuse
 import logging
 import myfs
+import audio_fetch
 
 class SpotifyFS():
     def __init__(self):
@@ -31,11 +36,53 @@ class SpotifyFS():
         self.spotify = spotipy.Spotify(auth=self.token)
         print("me: %s" % self.spotify.me())
 
+        self.audio_fetch = audio_fetch.SpotifyAudioFetcher()
+
         self.rootEntry = SpotifyFS.RootEntry(self)
         self.artistEntries = {}
         self.albumEntries = {}
         self.trackEntries = {}
         self.playlistEntries = {}
+
+
+    class AudioStreamFile(myfs.FsEntry):
+        next_fh = 0
+        open_files = {}
+
+        def __init__(self, spotifyfs, trackInfo):
+            self.spotifyfs = spotifyfs
+            self.trackInfo = trackInfo
+
+        def getattr(self, path, fi=None):
+            now = time.time()
+            filelen = 1
+            if fi is not None:
+                filelen = SpotifyFS.AudioStreamFile.open_files[fi.fh].buf_len()
+
+            return dict(
+              st_mode=(S_IFREG | 0o755),
+              st_nlink=1,
+              st_size=max(filelen, 1),
+              st_ctime=now,
+              st_mtime=now,
+              st_atime=now)
+
+        def open(self, path, fi):
+            fh = SpotifyFS.AudioStreamFile.next_fh
+            SpotifyFS.AudioStreamFile.next_fh += 1
+
+            SpotifyFS.AudioStreamFile.open_files[fh] = self.spotifyfs.audio_fetch.play(self.trackInfo['id'])
+
+            fi.direct_io = True
+            fi.fh = fh
+
+        def release(self, path, fi):
+            SpotifyFS.AudioStreamFile.open_files[fi.fh].close()
+            del SpotifyFS.AudioStreamFile.open_files[fi.fh]
+
+        def read(self, path, size, offset, fi):
+            return SpotifyFS.AudioStreamFile.open_files[fi.fh].read(size, offset)
+
 
     class DirEntry(myfs.DirEntry):
         raw_file = '.data.json'
@@ -168,10 +215,11 @@ class SpotifyFS():
 
         def listFiles(self):
             track = self.getRawData()
-            if track['preview_url'] is not None:
-                yield 'sample.mp3', lambda: myfs.Urllib1FileEntry(track['preview_url'], fake_size=1024)
-            else:
-                yield 'sample.mp3', lambda: ''
+            #if track['preview_url'] is not None:
+                #yield 'sample.mp3', lambda: myfs.Urllib1FileEntry(track['preview_url'], fake_size=1024)
+            #else:
+                #yield 'sample.mp3', lambda: ''
+            yield 'sample.mp3', lambda: SpotifyFS.AudioStreamFile(self.spotifyfs, track)
 
 
     class ArtistEntry(DirEntry):
@@ -661,4 +709,4 @@ class SpotifyFS():
 
 if __name__ == '__main__':
     logging.basicConfig(level=logging.DEBUG)
-    fuse.FUSE(myfs.LoggingFs(SpotifyFS().rootEntry), sys.argv[1], foreground=True)
+    fuse.FUSE(myfs.LoggingFs(SpotifyFS().rootEntry), sys.argv[1], foreground=True, raw_fi=True)

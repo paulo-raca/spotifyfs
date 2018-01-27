@@ -26,7 +26,7 @@ class LoggingFs(fuse.Operations):
             ret = str(e)
             raise
         finally:
-            self.log.debug('<- %s %s', op, repr(ret))
+            self.log.debug('<- %s %s', op, '%d bytes' % len(ret) if isinstance(ret, bytes) else repr(ret))
 
 
 
@@ -112,18 +112,18 @@ class Urllib1FileEntry(FsEntry):
             data = response.read()
             Urllib1FileEntry.open_files[fh] = data
             Urllib1FileEntry.cached_size[self.url] = len(data)
-        return fh
+        fi.fh = fh
 
-    def release(self, path, fh):
-        del Urllib1FileEntry.open_files[fh]
+    def release(self, path, fi):
+        del Urllib1FileEntry.open_files[fi.fh]
 
-    def read(self, path, size, offset, fh):
-        return Urllib1FileEntry.open_files[fh][offset:offset + size]
+    def read(self, path, size, offset, fi):
+        return Urllib1FileEntry.open_files[fi.fh][offset:offset + size]
 
-    def getSize(self, fh):
+    def getSize(self, fi):
         # Try to get size from buffer is the file is open
-        if fh is not None:
-            return len(Urllib1FileEntry.open_files[fh])
+        if fi is not None:
+            return len(Urllib1FileEntry.open_files[fi.fh])
 
         # Try to get cached file size
         try:
@@ -145,12 +145,12 @@ class Urllib1FileEntry(FsEntry):
         except:
             return 0
 
-    def getattr(self, path, fh=None):
+    def getattr(self, path, fi=None):
         now = time()
         return dict(
           st_mode=(S_IFREG | 0o755),
           st_nlink=1,
-          st_size=self.getSize(fh),
+          st_size=self.getSize(fi),
           st_ctime=now,
           st_mtime=now,
           st_atime=now)
