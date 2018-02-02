@@ -44,7 +44,7 @@ class SpotifyAudioFetcher():
             def buf_len(self):
                 return 0
 
-            def read(self, size, offset):
+            def read(self, size):
                 with self.cond:
                     # Lazy open
                     if self.lame is None:
@@ -80,7 +80,10 @@ class SpotifyAudioFetcher():
                     self.audio_fetcher.semaphore.release()
 
                     # Signal to anyone waiting on the cond
-                    self.lame.stdin.close()
+                    try:
+                        self.lame.stdin.close()
+                    except:
+                        pass
                     self.playing = False
                     self.cond.notify_all()
 
@@ -102,8 +105,8 @@ class SpotifyAudioFetcher():
 if __name__ == '__main__':
     fetcher = SpotifyAudioFetcher()
     player1 = fetcher.play('2dA7eKXUzw1Ndc78kKRefH')
-    print(player1.read(10))
-    print(player1.read(10))
-    print(player1.read(10))
-    print(player1.read(10))
-    player1.wait()
+    while True:
+        buf = player1.read(128)
+        if not buf:
+            break
+        print(buf)
