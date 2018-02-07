@@ -13,6 +13,7 @@ from expiringdict import ExpiringDict
 from functools import partial
 from stat import S_IFDIR, S_IFLNK, S_IFREG
 
+import urllib
 import inspect
 import sys
 import json
@@ -63,6 +64,16 @@ class SpotifyFS(fusetree.DictDir):
         }
 
         fusetree.DictDir.__init__(self, rootNode)
+
+    def getUrl(self, url):
+        try:
+            return self.cache[('url', url)]
+        except:
+            response = urllib.request.urlopen(url)
+            data = response.read()
+            response.close
+            self.cache[('url', url)] = data
+            return data
 
     def getArtist(self, id):
         try:
@@ -296,8 +307,12 @@ class AlbumNode(SpotifyDir):
             tracks_it = self.spotifyfs.spotify.next(tracks_it)
             album['tracks'] += tracks_it['items']
 
+        track_album = dict(album)
+        del track_album['tracks']
         for track in album['tracks']:
-            self.spotifyfs.cache[(TrackNode.__name__, track['id'])] = track
+            track_data = dict(track)
+            track_data['album'] = track_album
+            self.spotifyfs.cache[(TrackNode.__name__, track['id'])] = track_data
 
         return album
 
@@ -436,27 +451,108 @@ class TrackNode(SpotifyDir):
     image_file = '.track.jpg'
 
     def fetch_content(self) -> NodeContent:
-        return self.spotify.track(self.id)
+        return self.spotifyfs.spotify.track(self.id)
 
     def list_files(self, content: NodeContent) -> Iterator[Tuple[str, LazyNode, int]]:
         if content['preview_url'] is not None:
             yield 'sample.mp3', lambda: fusetree.UrllibFile(content['preview_url']), FILE_MODE
         else:
             yield 'sample.mp3', lambda: '', FILE_MODE
-        yield 'audio.mp3', lambda: TrackAudioFile(self.spotifyfs, content['id'], FILE_MODE), FILE_MODE
+        yield 'audio.mp3', lambda: TrackAudioFile(self.spotifyfs, content, FILE_MODE), FILE_MODE
 
 
 class TrackAudioFile(SpotifyNode):
+    def __init__(self, spotifyfs, track, mode):
+        super().__init__(spotifyfs, track['id'], mode)
+        self.track = track
+
     def open(self, path, mode):
-        return TrackAudioFile.Handle(self, self.spotifyfs, self.id)
+        return TrackAudioFile.Handle(self, self.spotifyfs, self.track)
 
     class Handle(fusetree.FileHandle):
-        def __init__(self, node, spotifyfs, id):
+        def __init__(self, node, spotifyfs, track):
             super().__init__(node, direct_io = True)
-            self.playback = spotifyfs.audio_fetch.play(id)
+            self.id3 = self.gen_id3(spotifyfs, track)
+            self.playback = spotifyfs.audio_fetch.play(track['id'])
+
+        def gen_id3(self, spotifyfs, track):
+            """
+            Generate an ID3 frame to be prepended to actual MP3 stream
+            Inspired by spotify-downloader:
+            https://github.com/ritiek/spotify-downloader/blob/master/core/metadata.py
+            """
+            from mutagen.easyid3 import EasyID3
+            from mutagen.id3 import ID3, TORY, TYER, TPUB, APIC, USLT, COMM
+            import tempfile
+
+            with tempfile.TemporaryFile() as fp:
+                track = spotifyfs.spotify.track(track['id'])
+                album = spotifyfs.getAlbum(track['album']['id']).content
+
+                num_discs = 0
+                num_tracks = 0
+                for t in album['tracks']:
+                    num_discs = max(num_discs, t['disc_number'])
+                    if t['disc_number'] == track['disc_number']:
+                        num_tracks = max(num_tracks, t['track_number'])
+
+                metadata = EasyID3()
+                metadata['website'] = track['external_urls']['spotify']
+                metadata['title'] = track['name']
+                metadata['artist'] = [artist['name'] for artist in track['artists']]
+                metadata['album'] = album['name']
+                metadata['albumartist'] = [artist['name'] for artist in album['artists']]
+                metadata['tracknumber'] = [track['track_number'], num_tracks]
+                metadata['discnumber'] = [track['disc_number'], num_discs]
+                metadata['length'] = str(track['duration_ms'] / 1000.0)
+                metadata['date'] = album['release_date']
+                metadata['genre'] = album['genres']
+
+                try:
+                    metadata['encodedby'] = album['label']
+                except:
+                    pass
+
+                try:
+                    metadata['copyright'] = album['copyrights'][0]['text']
+                except:
+                    pass
+
+                try:
+                    metadata['isrc'] = track['external_ids']['isrc']
+                except:
+                    pass
+
+                metadata.save(fp, v1=2)
+                fp.seek(0)
+
+                metadata = ID3(fp)
+                albumart = urllib.request.urlopen(track['album']['images'][0]['url'])
+                metadata['APIC'] = APIC(encoding=3, mime='image/jpeg', type=3, desc=u'Cover', data=albumart.read())
+
+                #try to fetch lyrics -- This can be improved...
+                try:
+                    import lyricwikia
+                    print('Looking for lyrics', track['artists'][0]['name'], track['name'])
+                    lyrics = lyricwikia.get_lyrics(track['artists'][0]['name'], track['name'])
+                    metadata['USLT'] = USLT(encoding=3, desc=u'Lyrics', text=lyrics)
+                except:
+                    print('lyrics lookup failed')
+                    pass
+
+                albumart.close()
+                metadata.save(fp)
+                fp.seek(0)
+
+                return fp.read()
 
         def read(self, path, size, offset):
-            return self.playback.read(size)
+            if len(self.id3) > 0:
+                chunk = self.id3[0:size]
+                self.id3 = self.id3[size:]
+                return chunk
+            else:
+                return self.playback.read(size)
 
         def release(self, path):
             self.playback.close()
