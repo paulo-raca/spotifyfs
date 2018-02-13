@@ -57,7 +57,8 @@ class SpotifyAudioFetcher():
                             [
                                 "lame",
                                 "-r", "-s", "44.1", "--bitwidth", "16", # Raw PCM, 16-bit, 44.1kHz,
-                                "-V", "0",  # High-quality encoding
+                                #"-V", "0",  # High-quality VBR encoding
+                                "-b", "192",  # High-quality encoding
                                 "--verbose",  #Dump shit on screen
                                 "-", "-"  # Use stdin/stdout to read/write streams
                             ],
