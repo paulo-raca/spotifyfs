@@ -3,16 +3,16 @@
 
 from stat import S_IFDIR, S_IFLNK, S_IFREG
 
-from typing import Tuple, Callable, Iterator, Union, Any
+from typing import Tuple, Callable, Iterator, Union, Any, Iterable, Dict
 
-import spotipy
-import spotipy.oauth2
 import spotipy.util
 
 from expiringdict import ExpiringDict
 from functools import partial
 from stat import S_IFDIR, S_IFLNK, S_IFREG
 
+import asyncio
+import aiohttp
 import urllib
 import inspect
 import sys
@@ -26,32 +26,37 @@ import audio_fetch
 
 FILE_MODE = S_IFREG | 0o444
 FILE_MODE_RW = S_IFREG | 0o666
-DIR_MODE = S_IFDIR | 0o444
-DIR_MODE_RW = S_IFDIR | 0o666
+DIR_MODE = S_IFDIR | 0o555
+DIR_MODE_RW = S_IFDIR | 0o777
+
+SPOTIFY_CLIENT_ID='85fe52cff756410095a3714c028c288b'
+SPOTIFY_CLIENT_SECRET='822d085d81af4aae9ad800609dcc3706'
+
+def escape_filename(name):
+    return name.replace('/', '∕')
 
 class SpotifyFS(fusetree.DictDir):
-    def __init__(self):
+    def __init__(self, country='us'):
         # There is a massive performance gain if we cache a directory's contents.
         self.cache = ExpiringDict(max_len=64*1024, max_age_seconds=3600)
+        self.country = country
 
+        #FIXME -- Don't rely on spotipy and copy-pasting for authentication
         self.token = spotipy.util.prompt_for_user_token(
             '1252589511',
             'user-library-read user-library-modify user-follow-read user-follow-modify playlist-read-private playlist-read-collaborative playlist-modify-private',
-            client_id='85fe52cff756410095a3714c028c288b',
-            client_secret='822d085d81af4aae9ad800609dcc3706',
+            client_id=SPOTIFY_CLIENT_ID,
+            client_secret=SPOTIFY_CLIENT_SECRET,
             redirect_uri='https://example.com')
-        self.spotify = spotipy.Spotify(auth=self.token)
-
-        self.audio_fetch = audio_fetch.SpotifyAudioFetcher()
 
         self.artistNodes = {}
         self.albumNodes = {}
         self.trackNodes = {}
         self.playlistNodes = {}
 
-        rootNode = {
+        fusetree.DictDir.__init__(self, {
             'Artists': FollowedArtistsNode(self, id=None, mode=DIR_MODE_RW),
-            'Playlists': UserPlaylistsNode(self, id='me', mode=DIR_MODE_RW),
+            #'Playlists': UserPlaylistsNode(self, id='me', mode=DIR_MODE_RW),
             #'Saved Albums': {},
             #'Saved Tracks': {},
             # Top Artists
@@ -61,19 +66,31 @@ class SpotifyFS(fusetree.DictDir):
             #'Featured Playlists': {},
             #'New Releases': {},
             #'Recommendations': {},
-        }
+        })
 
-        fusetree.DictDir.__init__(self, rootNode)
+    async def remember(self):
+        self.aiohttp_session = aiohttp.ClientSession(loop=asyncio.get_event_loop())
+        self.audio_fetch = audio_fetch.SpotifyAudioFetcher(loop=asyncio.get_event_loop())
 
-    def getUrl(self, url):
-        try:
-            return self.cache[('url', url)]
-        except:
-            response = urllib.request.urlopen(url)
-            data = response.read()
-            response.close
-            self.cache[('url', url)] = data
-            return data
+    async def forget(self) -> None:
+        await self.aiohttp_session.close()
+
+    async def request(self, url, method='GET', **kwargs):
+        url = urllib.parse.urljoin('https://api.spotify.com/v1/', url)
+        response = await self.aiohttp_session.request(url=url, headers={'Authorization': f'Bearer {self.token}'}, method=method, **kwargs)
+        return await response.json()
+
+    async def request_list(self, path, key=None, **kwargs):
+        it = await self.request(path, **kwargs)
+        if key is not None:
+            it = it[key]
+        items = it['items']
+        while it['next']:
+            it = await self.request(it['next'])
+            if key is not None:
+                it = it[key]
+            items += it['items']
+        return items
 
     def getArtist(self, id):
         try:
@@ -95,229 +112,289 @@ class SpotifyFS(fusetree.DictDir):
         try:
             return self.playlistNodes[(userId, playlistId)]
         except:
-            playlistNode = PlaylistNode(self, (userId, playlistId), DIR_MODE_RW)
+            playlistNode = ""#PlaylistNode(self, (userId, playlistId), DIR_MODE_RW)
             self.playlistNodes[(userId, playlistId)] = playlistNode
             return playlistNode
 
-    def getTrack(self, id):
+    def getTrack(self, id, duration_ms):
         try:
-            return self.trackNodes[id]['audio.mp3']
+            return self.trackNodes[id]
         except:
-            trackNode = TrackNode(self, id, DIR_MODE)
+            trackNode = TrackNode(self, id, FILE_MODE, duration_ms)
             self.trackNodes[id] = trackNode
-            return trackNode['audio.mp3']
-
-
-NodeContent = Any
-LazyNode = Union[fusetree.Node_Like, Callable[[], fusetree.Node_Like]]
-
+            return trackNode
 
 class SpotifyNode(fusetree.Node):
     def __init__(self, spotifyfs, id, mode):
         self.mode = mode
         self.spotifyfs = spotifyfs
-        self.cache = spotifyfs.cache
         self.id = id
         self.cache_id = (self.__class__.__name__, id)
-        self.cached_entries = None
 
-    def getattr(self, path: fusetree.Path) -> fusetree.Stat:
+    async def getattr(self) -> fusetree.Stat:
         return fusetree.Stat(
             st_mode=self.mode
         )
 
-    def _remove_from_parent(self, path: fusetree.Path) -> None:
-        """
-        Remove a file
-        """
-        parent_dir = path.elements[-2][1]
-
-        if not isinstance(parent_dir, SpotifyDir):
-            raise fuse.FuseOSError(errno.ENOSYS)
-
-        parent_dir.remove_child(path.elements[-1][0], path.elements[-1][1])
-
-    def unlink(self, path: fusetree.Path) -> None:
-        self._remove_from_parent(path)
-
-    def rmdir(self, path: fusetree.Path) -> None:
-        self._remove_from_parent(path)
-
-    def rename(self, path: fusetree.Path, new_path: fusetree.Path, new_name: str) -> None:
-        src_dir = path.elements[-2][1]
-        dest_dir = new_path.elements[-1][1]
-
-        if src_dir != dest_dir or not isinstance(src_dir, SpotifyNode):
-            raise fuse.FuseOSError(errno.EPERM)
-
-        src_dir.rename_child(path.elements[-1][0], new_name, path.elements[-1][1])
+    async def invalidate(self):
+        del self.spotifyfs.cache[self.cache_id]
 
 
-class SpotifyDir(SpotifyNode, fusetree.BaseDir):
+class SpotifyDir(SpotifyNode):
     content_file: str = None
     image_file: str = None
-    default_image = 'https://www1-lw.xda-cdn.com/files/2013/09/music.jpg'
+    default_image = None
 
-    def fetch_content(self) -> NodeContent:
+    def __init__(self, spotifyfs, id, mode):
+        super().__init__(spotifyfs, id, mode)
+
+        self._raw_content = None
+        self._files = None
+
+    async def invalidate(self):
+        super().invalidate()
+        self._raw_content = None
+        self._files = None
+
+    async def fetch_content(self):
         """
         Fetches all relevant data for this node from Spotify
         """
         return {}  ## Override this method!
 
-    def list_files(self, content: NodeContent) -> Iterator[Tuple[str, LazyNode, fusetree.Stat]]:
+    async def describe_content(self, content) -> Dict[str, str]:
+        """
+        Returns a label, URL and image URL that describe this folder
+        """
+        ret = {}
+        for key in ['name', 'url', 'uri']:
+            try:
+                ret[key] = content[key]
+            except:
+                pass
+
+        try:
+            ret['image'] = content['images'][0]['url']
+        except:
+            pass
+
+        return ret
+
+    async def content_to_files(self, content) -> Dict[str, fusetree.Node]:
         """
         List the content of this directory
         """
-        return iter([])  ## Override this to fetch some
+        return {} ## Override this to fetch something
 
-    def add_child(self, name_or_node: Union[str, fusetree.Node]) -> None:
-        raise fuse.FuseOSError(errno.ENOSYS)
-
-    def remove_child(self, name: str, node: fusetree.Node) -> None:
-        raise fuse.FuseOSError(errno.ENOSYS)
-
-    def rename_child(self, old_name: str, new_name: str, node: fusetree.Node) -> None:
-        raise fuse.FuseOSError(errno.ENOSYS)
-
-    def get_hidden_file(self, name: str) -> LazyNode:
-        """
-        Fetch something that has not been listed on the directory.
-        E.g., accessing `Artists/Random Dude` should work whenever
-        Random Dude is in your favorite list or not
-        """
-        return None
-
-    def invalidate_cache(self) -> None:
-        """
-        Remove all cached content relative to this node
-        """
-        del self.cache[self.cache_id]
-        self.cached_entries = None
-
-    @property
-    def content(self) -> NodeContent:
+    async def content(self):
         """
         Fetches all relevant data for this node, as fetched from Spotify.
 
         Caching will be used for speed, call invalidate() if you expect something to change.
         """
-        content = self.cache.get(self.cache_id, None)
-        if content is None:
-            content = self.fetch_content()
-            self.cache[self.cache_id] = content
+        if self._raw_content is None:
+            self._raw_content = self.spotifyfs.cache.get(self.cache_id, None)
+            if self._raw_content is None:
+                self._raw_content = await self.fetch_content()
+                self.spotifyfs.cache[self.cache_id] = self._raw_content
+        return self._raw_content
 
-        return content
+    async def files(self) -> Dict[str, fusetree.Node]:
+        if self._files is None:
+            content = await self.content()
+            content_desc = await self.describe_content(content)
 
-    def opendir(self, path: fusetree.Path) -> Iterator[Tuple[str, fusetree.Stat]]:
-        content = self.content
-        self.cached_entries = {}
-
-        yield '.directory', FILE_MODE
-        if self.content_file is not None:
-            yield self.content_file, FILE_MODE
-        if self.image_file is not None:
-            try:
-                url = self.content['images'][0]['url']
-                yield self.image_file, FILE_MODE
-            except:
-                pass
-
-        for name, entry, stat in self.list_files(content):
-            self.cached_entries[name] = entry
-            yield name, stat
-
-    def mkdir(self, path: fusetree.Path, name: str, mode: int) -> None:
-        self.add_child(name)
-
-    def mknod(self, path: fusetree.Path, name: str, mode: int, dev: int) -> None:
-        self.add_child(name)
-
-    def link(self, path: fusetree.Path, name: str, target: fusetree.Path) -> None:
-        self.add_child(target.target_node)
-
-    def __getitem__(self, name) -> fusetree.Node_Like:
-        if name == '.directory':
-            return inspect.cleandoc(f"""
+            files = {}
+            files['.directory'] = inspect.cleandoc(f"""
                 [Desktop Entry]
-                Name=Foo
-                Comment=Foobar comment
+                Name={content_desc.get('name', '')}
+                Comment={content_desc.get('url', '')}
                 Icon=./{self.image_file}
                 Type=Directory
                 """)
 
-        if name == self.content_file:
-            return json.dumps(self.content, indent=4)
+            if self.content_file is not None:
+                files[self.content_file] = json.dumps(content, indent=4)
 
-        if name == self.image_file:
-            try:
-                return fusetree.UrllibFile(self.content['images'][0]['url'])
-            except:
-                return fusetree.UrllibFile(self.default_image)
+            if self.image_file is not None:
+                image_url = content_desc.get('image', self.default_image)
+                if image_url is not None:
+                    files[self.image_file] = fusetree.HttpFile(image_url)
+
+            content_files = await self.content_to_files(content)
+            files.update({
+                escape_filename(name): node
+                for name, node in content_files.items()
+            })
+
+            self._files = files
+        return self._files
+
+    async def opendir(self):
+        return list((await self.files()).items())
+
+    async def lookup(self, name: str):
+        files = await self.files()
+        return files.get(name, None)
+
+    #async def add_child(self, name: str, node: fusetree.Node = None) -> None:
+        #raise fuse.FuseOSError(errno.ENOSYS)
+
+    #async def mkdir(self, path: fusetree.Path, name: str, mode: int) -> None:
+        #await self.add_child(name)
+
+    #async def mknod(self, path: fusetree.Path, name: str, mode: int, dev: int) -> None:
+        #await self.add_child(name)
+
+    #async def link(self, path: fusetree.Path, name: str, target: fusetree.Path) -> None:
+        #await self.add_child(name, target)
 
 
-        if self.cached_entries is None:
-            list(self.opendir(None))
 
-        handler = self.cached_entries.get(name, None)
-        if handler is None:
-            handler = self.get_hidden_file(name)
-            if handler is not None:
-                self.cached_entries[name] = handler
+    #async def remove_child(self, name: str) -> None:
+        #raise fuse.FuseOSError(errno.ENOSYS)
 
-        if callable(handler):
-            handler = handler()
-        return handler
+    #def unlink(self, name: str) -> None:
+        #await self.remove_child(name)
+
+    #def rmdir(self, name: str) -> None:
+        #self._remove_from_parent(path)
+
+
+    #def remove_child(self, name: str, node: fusetree.Node) -> None:
+        #raise fuse.FuseOSError(errno.ENOSYS)
+
+    #def rename_child(self, old_name: str, new_name: str, node: fusetree.Node) -> None:
+        #raise fuse.FuseOSError(errno.ENOSYS)
+
+    #def get_hidden_file(self, name: str) -> LazyNode:
+        #"""
+        #Fetch something that has not been listed on the directory.
+        #E.g., accessing `Artists/Random Dude` should work whenever
+        #Random Dude is in your favorite list or not
+        #"""
+        #return None
+
+    #def invalidate_cache(self) -> None:
+        #"""
+        #Remove all cached content relative to this node
+        #"""
+        #del self.cache[self.cache_id]
+        #self.cached_entries = None
+
+    #@property
+    #def content(self) -> NodeContent:
+        #"""
+        #Fetches all relevant data for this node, as fetched from Spotify.
+
+        #Caching will be used for speed, call invalidate() if you expect something to change.
+        #"""
+        #content = self.cache.get(self.cache_id, None)
+        #if content is None:
+            #content = self.fetch_content()
+            #self.cache[self.cache_id] = content
+
+        #return content
+
+    #def opendir(self, path: fusetree.Path) -> Iterator[Tuple[str, fusetree.Stat]]:
+        #content = self.content
+        #self.cached_entries = {}
+
+        #yield '.directory', FILE_MODE
+        #if self.content_file is not None:
+            #yield self.content_file, FILE_MODE
+        #if self.image_file is not None:
+            #try:
+                #url = self.content['images'][0]['url']
+                #yield self.image_file, FILE_MODE
+            #except:
+                #pass
+
+        #for name, entry, stat in self.list_files(content):
+            #self.cached_entries[name] = entry
+            #yield name, stat
+
+
+    #def __getitem__(self, name) -> fusetree.Node_Like:
+        #if name == '.directory':
+            #return inspect.cleandoc(f"""
+                #[Desktop Entry]
+                #Name=Foo
+                #Comment=Foobar comment
+                #Icon=./{self.image_file}
+                #Type=Directory
+                #""")
+
+        #if name == self.content_file:
+            #return json.dumps(self.content, indent=4)
+
+        #if name == self.image_file:
+            #try:
+                #return fusetree.UrllibFile(self.content['images'][0]['url'])
+            #except:
+                #return fusetree.UrllibFile(self.default_image)
+
+
+        #if self.cached_entries is None:
+            #list(self.opendir(None))
+
+        #handler = self.cached_entries.get(name, None)
+        #if handler is None:
+            #handler = self.get_hidden_file(name)
+            #if handler is not None:
+                #self.cached_entries[name] = handler
+
+        #if callable(handler):
+            #handler = handler()
+        #return handler
 
 
 class ArtistNode(SpotifyDir):
-    # TODO:
-    # - Related Artists
-    # - Top Tracks
-
     content_file = '.artist.json'
     image_file = '.artist.jpg'
 
-    def fetch_content(self) -> NodeContent:
-        artist = self.spotifyfs.spotify.artist(self.id)
+    async def fetch_content(self):
+        content, related_artists, top_tracks, albuns = await asyncio.gather(
+            self.spotifyfs.request(f'artists/{self.id}'),
+            self.spotifyfs.request(f'artists/{self.id}/related-artists'),
+            self.spotifyfs.request(f'artists/{self.id}/top-tracks', params={'country': self.spotifyfs.country}),
+            self.spotifyfs.request_list(f'artists/{self.id}/albums', params={'market': self.spotifyfs.country, 'limit': 50}),
+        )
+        content['related-artists'] = related_artists['artists']
+        content['top-tracks'] = top_tracks['tracks']
+        content['albuns'] = albuns
+        return content
 
-        albums_it = self.spotifyfs.spotify.artist_albums(self.id, limit=50)
-        artist['albums'] = albums_it['items']
-        while albums_it['next']:
-            albums_it = self.spotifyfs.spotify.next(albums_it)
-            artist['albums'] += albums_it['items']
-
-        return artist
-
-    def list_files(self, content: NodeContent) -> Iterator[Tuple[str, LazyNode, int]]:
-        for album in content['albums']:
-            filename = album['name']
-            yield filename, partial(lambda id: self.spotifyfs.getAlbum(id), album['id']), DIR_MODE
-
+    async def content_to_files(self, content):
+        return {
+            'Related Artists': {
+                artist["name"]: self.spotifyfs.getArtist(artist['id'])
+                for artist in content['related-artists']
+            },
+            'Top Tracks': {
+                f'{track["name"]}.mp3': self.spotifyfs.getTrack(track['id'], track['duration_ms'])
+                for i, track in enumerate(content['top-tracks'])
+            },
+            'Albuns': {
+                album["name"]: self.spotifyfs.getAlbum(album['id'])
+                for album in content['albuns']
+            },
+        }
 
 class AlbumNode(SpotifyDir):
     content_file = '.album.json'
     image_file = '.album.jpg'
 
-    def fetch_content(self) -> NodeContent:
-        album = self.spotifyfs.spotify.album(self.id)
-
-        tracks_it = album['tracks']
-        album['tracks'] = tracks_it['items']
-        while tracks_it['next']:
-            tracks_it = self.spotifyfs.spotify.next(tracks_it)
-            album['tracks'] += tracks_it['items']
-
-        track_album = dict(album)
-        del track_album['tracks']
-        for track in album['tracks']:
-            track_data = dict(track)
-            track_data['album'] = track_album
-            self.spotifyfs.cache[(TrackNode.__name__, track['id'])] = track_data
-
+    async def fetch_content(self):
+        album, tracks = await asyncio.gather(
+            self.spotifyfs.request(f'albums/{self.id}'),
+            self.spotifyfs.request_list(f'albums/{self.id}/tracks'),
+        )
+        album['tracks'] = tracks
         return album
 
-    def list_files(self, content: NodeContent) -> Iterator[Tuple[str, LazyNode, int]]:
-        tracks = self.content['tracks']
+    async def content_to_files(self, content):
+        tracks = content['tracks']
 
         track_numbers = set()
         disc_numbers = set()
@@ -325,157 +402,119 @@ class AlbumNode(SpotifyDir):
         for track in tracks:
             track_numbers.add(track['track_number'])
             disc_numbers.add(track['disc_number'])
+        track_digits = len(str(max(track_numbers)))
+        disc_digits = len(str(max(disc_numbers)))
 
+        ret = {}
         for track in tracks:
             filename = track['name'] + '.mp3'
-            track_number = track['track_number']
-            disc_number = track['disc_number']
+            track_number = str(track['track_number']).zfill(track_digits)
+            disc_number = str(track['disc_number']).zfill(disc_digits)
 
-            if len(track_numbers) > 1:
-                filename = f'{track_number:03d} - {filename}'
-                if len(disc_numbers) > 1:
-                    filename = f'{disc_number:01d}:{filename}'
+            if len(disc_numbers) > 1:
+                filename = f'{disc_number}:{track_number} - {filename}'
+            elif len(track_numbers) > 1:
+                filename = f'{track_number} - {filename}'
 
-            yield filename, partial(lambda id: self.spotifyfs.getTrack(id), track['id']), FILE_MODE
+            ret[filename] = self.spotifyfs.getTrack(track['id'], track['duration_ms'])
+        return ret
 
 
-class PlaylistNode(SpotifyDir):
-    # TODO:
-    # - Better parsing of track order from filename
+class FollowedArtistsNode(SpotifyDir):
+    content_file = '.followed_artists.json'
 
-    content_file = '.playlist.json'
-    image_file = '.playlist.jpg'
+    async def fetch_content(self):
+        return await self.spotifyfs.request_list(f'me/following', params={'type': 'artist', 'limit': 50}, key='artists')
 
-    def fetch_content(self) -> NodeContent:
-        playlist = self.spotifyfs.spotify.user_playlist(self.id[0], self.id[1])
+    async def content_to_files(self, content):
+        return {
+            artist["name"]: self.spotifyfs.getArtist(artist['id'])
+            for artist in content
+        }
 
-        tracks_it = playlist['tracks']
-        playlist['tracks'] = tracks_it['items']
-        while tracks_it['next']:
-            tracks_it = self.spotifyfs.spotify.next(tracks_it)
-            playlist['tracks'] += tracks_it['items']
 
-        playlist['tracks'] = [
-            track['track']
-            for track in playlist['tracks']
-            if not track['is_local']
-        ]
-
-        for track in playlist['tracks']:
-            self.spotifyfs.cache[(TrackNode.__name__, track['id'])] = track
-
-        return playlist
-
-    def list_files(self, content: NodeContent) -> Iterator[Tuple[str, LazyNode, int]]:
-        n = 0
-        for track in content['tracks']:
-            filename = track['name'] + '.mp3'
-            artist_names = ', '.join([artist['name'] for artist in track['artists']])
-            if artist_names:
-                filename = f'{artist_names} - {filename}'
-
-            n += 1
-            filename = f'{n:03d} - {filename}'
-            yield filename, partial(lambda id: self.spotifyfs.getTrack(id), track['id']), FILE_MODE
-
-    def add_child(self, name_or_node):
-        track_id = None
-        if isinstance(name_or_node, TrackNode) or isinstance(name_or_node, TrackAudioFile):
-              track_id = name_or_node.id
-        elif isinstance(name_or_node, str):
-            results = self.spotifyfs.spotify.search(q=name_or_node, type='track')
-            items = results['tracks']['items']
-            if len(items) != 0:
-                track_id = items[0]['id']
-
-        print(f'Playlist.add_child {name_or_node}')
-        if track_id is None:
-            raise fuse.FuseOSError(errno.ENOENT)
-
-        try:
-            self.spotifyfs.spotify.user_playlist_add_tracks(self.id[0], self.id[1], [track_id])
-            self.invalidate_cache()
-        except:
-            raise fuse.FuseOSError(errno.EPERM)
-
-    def remove_child(self, name, node):
-        track_id = None
-        if isinstance(node, TrackNode) or isinstance(node, TrackAudioFile):
-            track_id = node.id
-
-        if track_id is None:
-            raise fuse.FuseOSError(errno.ENOENT)
-
-        try:
-            position = int(name.split(' - ')[0]) - 1
-            print(f'Removing {track_id} at {position}')
-
-            self.spotifyfs.spotify.user_playlist_remove_specific_occurrences_of_tracks(
-                self.id[0], self.id[1],
-                [{'uri': track_id, 'positions':[position]}],
-                snapshot_id=self.content['snapshot_id']
-            )
-            self.invalidate_cache()
-        except:
-            raise fuse.FuseOSError(errno.EPERM)
-
-    def rename_child(self, old_name: str, new_name: str, node: fusetree.Node) -> None:
-        track_id = None
-        if isinstance(node, TrackNode) or isinstance(node, TrackAudioFile):
-            track_id = node.id
-
-        if track_id is None:
-            raise fuse.FuseOSError(errno.ENOENT)
-
-        try:
-            old_position = int(old_name.split(' - ')[0]) - 1
-            new_position = int(new_name.split(' - ')[0]) - 1
-
-            new_position = max(min(new_position, len(self.content['tracks']) - 1), 0)
-            if new_position > old_position:
-                new_position += 1
-            print(f'Moving {track_id} from {old_position} to {new_position}')
-
-            self.spotifyfs.spotify.user_playlist_reorder_tracks(
-                self.id[0], self.id[1],
-                old_position, new_position,
-                snapshot_id=self.content['snapshot_id']
-            )
-            self.invalidate_cache()
-        except:
-            raise
-            raise fuse.FuseOSError(errno.EPERM)
-
-class TrackNode(SpotifyDir):
+class TrackNode(SpotifyNode):
     content_file = '.track.json'
-    image_file = '.track.jpg'
 
-    def fetch_content(self) -> NodeContent:
-        return self.spotifyfs.spotify.track(self.id)
+    def __init__(self, spotifyfs, id, mode, duration_ms, bitrate=256):
+            super().__init__(spotifyfs, id, mode)
+            self.bitrate = bitrate
+            self.duration_ms = duration_ms
+            self.shared_handle = None
 
-    def list_files(self, content: NodeContent) -> Iterator[Tuple[str, LazyNode, int]]:
-        if content['preview_url'] is not None:
-            yield 'sample.mp3', lambda: fusetree.UrllibFile(content['preview_url']), FILE_MODE
-        else:
-            yield 'sample.mp3', lambda: '', FILE_MODE
-        yield 'audio.mp3', lambda: TrackAudioFile(self.spotifyfs, content, FILE_MODE), FILE_MODE
+    async def getattr(self) -> fusetree.Stat:
+        id3_v1_size = 128  # Fix size ID3v1
+        id3_v2_size = 4096  # Wild guess -- Depends mostly on cover image
+        audio_size = self.duration_ms * self.bitrate // 8
+
+        #if self.shared_handle is not None:
+            #if self.shared_handle.id3v1 is not None:
+                #id3_v1_size = len(self.shared_handle.id3v1)
+            #if self.shared_handle.id3v2 is not None:
+                #id3_v2_size = len(self.shared_handle.id3v2)
+            #if self.shared_handle.playback is not None:
+                #if self.shared_handle.playback.finished and self.shared_handle.playback.error is None:
+                    #audio_size = len(self.shared_handle.playback.buf)
+                #else:
+                    #audio_size = max(audio_size, len(self.shared_handle.playback.buf))
+
+        return fusetree.Stat(
+            st_mode = self.mode,
+            st_size = id3_v1_size + id3_v2_size + audio_size
+        )
+
+    async def open(self, mode):
+        if self.shared_handle is None:
+            self.shared_handle = TrackNode.Handle(self)
+        self.shared_handle.refs += 1
+        return self.shared_handle
+
+    class Handle (fusetree.FileHandle):
+        def __init__(self, node):
+            super().__init__(node, direct_io=True)
+            self.playback = None
+            self.id3v1 = None
+            self.id3v2 = None
+            self.refs = 0
+
+        async def read(self, size: int, offset: int) -> bytes:
+            if self.id3v2 is None:
+                track = await self.node.spotifyfs.request(f'tracks/{self.node.id}')
+                album = await self.node.spotifyfs.getAlbum(track['album']['id']).content()
+                self.id3v1, self.id3v2 = await self.id3(track, album)
+                print('ID3v2 len=', len(self.id3v2))
+            ret = self.id3v2[offset:offset+size]
+            if len(ret) != 0:
+                return ret
+            else:
+                offset -= len(self.id3v2)
 
 
-class TrackAudioFile(SpotifyNode):
-    def __init__(self, spotifyfs, track, mode):
-        super().__init__(spotifyfs, track['id'], mode)
-        self.track = track
+            if self.playback is None:
+                self.playback = self.node.spotifyfs.audio_fetch.play(
+                        self.node.id,
+                        lame_args = dict(
+                            bitrate = self.node.bitrate,
+                            write_id3tag_automatic = False
+                        ))
+            ret = await self.playback.read(offset, size)
+            if len(ret) != 0:
+                return ret
+            else:
+                offset -= len(self.playback.buf)
 
-    def open(self, path, mode):
-        return TrackAudioFile.Handle(self, self.spotifyfs, self.track)
 
-    class Handle(fusetree.FileHandle):
-        def __init__(self, node, spotifyfs, track):
-            super().__init__(node, direct_io = True)
-            self.id3 = self.gen_id3(spotifyfs, track)
-            self.playback = spotifyfs.audio_fetch.play(track['id'])
+            return self.id3v1[offset:offset+size]
 
-        def gen_id3(self, spotifyfs, track):
+        async def release(self) -> None:
+            self.refs -= 1
+            if self.refs == 0:
+                self.node.shared_handle = None
+
+                if self.playback is not None:
+                    await self.playback.close()
+
+        async def id3(self, track, album):
             """
             Generate an ID3 frame to be prepended to actual MP3 stream
             Inspired by spotify-downloader:
@@ -486,9 +525,6 @@ class TrackAudioFile(SpotifyNode):
             import tempfile
 
             with tempfile.TemporaryFile() as fp:
-                track = spotifyfs.spotify.track(track['id'])
-                album = spotifyfs.getAlbum(track['album']['id']).content
-
                 num_discs = 0
                 num_tracks = 0
                 for t in album['tracks']:
@@ -527,102 +563,30 @@ class TrackAudioFile(SpotifyNode):
                 fp.seek(0)
 
                 metadata = ID3(fp)
-                albumart = urllib.request.urlopen(track['album']['images'][0]['url'])
-                metadata['APIC'] = APIC(encoding=3, mime='image/jpeg', type=3, desc=u'Cover', data=albumart.read())
-
-                #try to fetch lyrics -- This can be improved...
                 try:
-                    import lyricwikia
-                    print('Looking for lyrics', track['artists'][0]['name'], track['name'])
-                    lyrics = lyricwikia.get_lyrics(track['artists'][0]['name'], track['name'])
-                    metadata['USLT'] = USLT(encoding=3, desc=u'Lyrics', text=lyrics)
+                    img_url = track['album']['images'][0]['url']
+                    async with self.node.spotifyfs.aiohttp_session.request(url=img_url, method='GET') as response:
+                        albumart = await response.read()
+                        metadata['APIC'] = APIC(encoding=3, mime='image/jpeg', type=3, desc=u'Cover', data=albumart)
                 except:
-                    print('lyrics lookup failed')
+                    import traceback
+                    traceback.print_exc()
                     pass
 
-                albumart.close()
+                ##try to fetch lyrics -- This can be improved...
+                #try:
+                    #import lyricwikia
+                    #print('Looking for lyrics', track['artists'][0]['name'], track['name'])
+                    #lyrics = lyricwikia.get_lyrics(track['artists'][0]['name'], track['name'])
+                    #metadata['USLT'] = USLT(encoding=3, desc=u'Lyrics', text=lyrics)
+                #except:
+                    #print('lyrics lookup failed')
+                    #pass
+
                 metadata.save(fp)
                 fp.seek(0)
 
-                return fp.read()
-
-        def read(self, path, size, offset):
-            if len(self.id3) > 0:
-                chunk = self.id3[0:size]
-                self.id3 = self.id3[size:]
-                return chunk
-            else:
-                return self.playback.read(size)
-
-        def release(self, path):
-            self.playback.close()
-
-
-class FollowedArtistsNode(SpotifyDir):
-    content_file = '.followed_artists.json'
-
-    def fetch_content(self):
-        artists_it = self.spotifyfs.spotify.current_user_followed_artists()['artists']
-        artists = artists_it['items']
-        while artists_it['next']:
-            artists_it = self.spotifyfs.spotify.next(artists_it)['artists']
-            artists += artists_it['items']
-
-        return artists
-
-    def list_files(self, content: NodeContent) -> Iterator[Tuple[str, LazyNode, int]]:
-        for artist in content:
-            filename = artist["name"]
-            yield filename, partial(lambda id: self.spotifyfs.getArtist(id), artist['id']), DIR_MODE
-
-    def add_child(self, name_or_node: Union[str, fusetree.Node]):
-        artist_id = None
-        if isinstance(name_or_node, ArtistNode):
-            artist_id = name_or_node.id
-        elif isinstance(name_or_node, str):
-            results = self.spotifyfs.spotify.search(q=name_or_node, type='artist')
-            items = results['artists']['items']
-            if len(items) != 0:
-                artist_id = items[0]['id']
-
-        if artist_id is None:
-            raise fuse.FuseOSError(errno.ENOENT)
-
-        self.spotifyfs.spotify.user_follow_artists([artist_id])
-        self.invalidate_cache()
-
-    def remove_child(self, name, node):
-        artist_id = None
-        if not isinstance(node, ArtistNode):
-            raise fuse.FuseOSError(errno.EPERM)
-
-        artist_id = node.id
-        self.spotifyfs.spotify.user_unfollow_artists([artist_id])
-        self.invalidate_cache()
-
-
-class UserPlaylistsNode(SpotifyDir):
-    # TODO:
-    # - Add / Remove / Rename playlist
-
-    content_file = '.playlists.json'
-
-    def fetch_content(self):
-        if self.id=='me':
-            playlists_it = self.spotifyfs.spotify.current_user_playlists()
-        else:
-            playlists_it = self.spotifyfs.spotify.user_playlists(self.id)
-        playlists = playlists_it['items']
-        while playlists_it['next']:
-            playlists_it = self.spotifyfs.spotify.next(playlists_it)
-            playlists += playlists_it['items']
-
-        return playlists
-
-    def list_files(self, content):
-        for playlist in content:
-            filename = playlist["name"]
-            yield filename, partial(lambda user, id: self.spotifyfs.getPlaylist(user, id), playlist['owner']['id'], playlist['id']), DIR_MODE
+                return b'', fp.read()
 
 
 if __name__ == '__main__':

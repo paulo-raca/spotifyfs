@@ -15,9 +15,8 @@ setup(
       'console_scripts': ['mount.spotifyfs=spotifyfs.__main__:main'],
   },
   install_requires = [
+    "fusetree",
     "spotipy",
-    "RouteFS",
-    "notify2",
     "expiringdict",
   ]
 )
